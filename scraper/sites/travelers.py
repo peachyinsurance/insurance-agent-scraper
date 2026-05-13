@@ -1,11 +1,11 @@
 """Site adapter for Travelers' public agent directory at agent.travelers.com."""
 
-import json
-import re
 from urllib.parse import urljoin, urlparse
 
 from bs4 import BeautifulSoup
 
+from scraper.core.jsonld import iter_jsonld_blocks
+from scraper.core.text import clean, format_phone
 from scraper.records import AgencyRecord
 
 
@@ -68,27 +68,13 @@ def parse_city_page(html: str, city_url: str) -> list[str]:
 
 # --- agency detail parsing --------------------------------------------------
 
-def _clean(value):
-    """Collapse internal whitespace (including newlines) and strip ends."""
-    if not isinstance(value, str):
-        return ""
-    return " ".join(value.split())
+def _agency_website_or_empty(url: str) -> str:
+    """Return url if it points to a real agency website, '' if it's a Travelers self-link.
 
-
-def _format_phone(raw):
-    """Normalize a phone number to '(NXX) NXX-XXXX'. Returns '' for clearly broken input."""
-    if not raw or not isinstance(raw, str):
-        return ""
-    digits = re.sub(r"\D", "", raw)
-    if len(digits) == 11 and digits.startswith("1"):
-        digits = digits[1:]
-    if len(digits) != 10:
-        return ""
-    return f"({digits[0:3]}) {digits[3:6]}-{digits[6:10]}"
-
-
-def _agency_website_or_empty(url):
-    """Return url if it points to a real agency website, '' if it's a Travelers self-link."""
+    Travelers-specific filter: the InsuranceAgency JSON-LD block's `url` field
+    points at Travelers' own directory page, not the agency's website. We don't
+    want that bleeding into the `website` column on Stage 2 output.
+    """
     if not isinstance(url, str) or not url:
         return ""
     parsed = urlparse(url)
@@ -98,48 +84,33 @@ def _agency_website_or_empty(url):
     return url
 
 
-def _extract_agency_jsonld(soup):
-    """Find the best structured-data block for an agency on a Travelers page.
+def _extract_agency_jsonld(soup) -> dict:
+    """Pick the best structured-data block for an agency on a Travelers page.
 
-    Prefers the Yext verifiable credential (credentialSubject) because it has
-    email + the agency's real website URL. Falls back to the schema.org
-    InsuranceAgency block (no email; its url points to Travelers itself).
-    Returns the dict, or {} if neither is present.
+    Travelers embeds two relevant JSON-LD blocks. We prefer the Yext verifiable
+    credential because its credentialSubject has the agency's real website URL
+    AND an email — neither of which the plain InsuranceAgency block carries
+    (its `url` points to Travelers itself, and there's no `email` field at all).
+    Falls back to the InsuranceAgency block when no Yext VC is present.
+    Returns {} if neither shape is found.
     """
     yext_subject = None
     insurance_agency = None
 
-    for script in soup.find_all("script", type="application/ld+json"):
-        try:
-            data = json.loads(script.string or "")
-        except (json.JSONDecodeError, TypeError):
-            continue
+    for item in iter_jsonld_blocks(soup):
+        # Yext verifiable credential — credentialSubject is one level deep
+        subject = item.get("credentialSubject")
+        if isinstance(subject, dict) and subject.get("name") and isinstance(subject.get("address"), dict):
+            yext_subject = subject
+            continue  # keep looking just in case, but VC wins if found
 
-        # Yext verifiable credential
-        if isinstance(data, dict) and isinstance(data.get("credentialSubject"), dict):
-            subject = data["credentialSubject"]
-            if subject.get("name") and isinstance(subject.get("address"), dict):
-                yext_subject = subject
-                continue  # keep looking in case there's anything later, but VC wins
-
-        # Schema.org InsuranceAgency (may be wrapped in @graph)
-        if isinstance(data, dict):
-            graph = data.get("@graph")
-            items = graph if isinstance(graph, list) else [data]
-        elif isinstance(data, list):
-            items = data
-        else:
-            continue
-
-        for item in items:
-            if (
-                isinstance(item, dict)
-                and item.get("@type") == "InsuranceAgency"
-                and item.get("name")
-                and isinstance(item.get("address"), dict)
-            ):
-                insurance_agency = item
-                break
+        # Schema.org InsuranceAgency — top-level type
+        if (
+            item.get("@type") == "InsuranceAgency"
+            and item.get("name")
+            and isinstance(item.get("address"), dict)
+        ):
+            insurance_agency = item
 
     return yext_subject or insurance_agency or {}
 
@@ -158,12 +129,12 @@ def parse_agency_page(html: str, source_url: str) -> AgencyRecord:
 
     return AgencyRecord(
         source_url=source_url,
-        agency_name=_clean(data.get("name")),
-        address_line=_clean(address.get("streetAddress")),
-        city=_clean(address.get("addressLocality")),
-        state=_clean(address.get("addressRegion")),
-        zip=_clean(address.get("postalCode")),
-        phone=_format_phone(data.get("telephone")),
+        agency_name=clean(data.get("name")),
+        address_line=clean(address.get("streetAddress")),
+        city=clean(address.get("addressLocality")),
+        state=clean(address.get("addressRegion")),
+        zip=clean(address.get("postalCode")),
+        phone=format_phone(data.get("telephone")),
         website_url=_agency_website_or_empty(data.get("url")),
-        email=_clean(data.get("email")).lower(),
+        email=clean(data.get("email")).lower(),
     )

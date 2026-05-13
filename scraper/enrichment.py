@@ -21,6 +21,7 @@ import requests
 from bs4 import BeautifulSoup
 
 from scraper.core.http import PerDomainLimiter, fetch_url
+from scraper.core.text import looks_like_email
 from scraper.records import AgencyRecord, EnrichedLead
 
 
@@ -169,14 +170,6 @@ class NameCandidate:
     has_title_nearby: bool
 
 
-def _looks_like_email(value: str) -> bool:
-    """Cheap sanity check: has @ and a dot in the domain."""
-    if not value or "@" not in value:
-        return False
-    local, _, domain = value.partition("@")
-    return bool(local) and "." in domain
-
-
 def extract_emails_from_html(html: str) -> list[str]:
     """Return all unique, lowercased email addresses found on the page.
 
@@ -203,13 +196,13 @@ def extract_emails_from_html(html: str) -> list[str]:
         body = href[len("mailto:"):].split("?", 1)[0]
         for email in body.split(","):
             email = email.strip()
-            if _looks_like_email(email):
+            if looks_like_email(email):
                 found.add(email.lower())
 
     text = soup.get_text(" ", strip=True)
     for match in EMAIL_REGEX.finditer(text):
         email = match.group(0)
-        if _looks_like_email(email):
+        if looks_like_email(email):
             found.add(email.lower())
 
     return sorted(found)
