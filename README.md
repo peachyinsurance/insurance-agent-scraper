@@ -1,331 +1,434 @@
-# Progressive Agent Scraper
+# Insurance Agent Scraper
 
-A two-stage Python scraper that pulls every independent insurance agency from
-[Progressive's public agent directory](https://www.progressiveagent.com/local-agent/)
-and produces a CSV ready to upload directly to Instantly for cold-email outreach.
+Pulls insurance agencies from carrier directories (Progressive, Travelers — more
+to come) into a CSV ready to upload to Instantly for cold-email outreach.
 
-Built for Next Call Club. Starting with Georgia; designed to scale to every US
-state, and eventually to be ported to other carriers (Travelers, etc.).
+Built for Next Call Club. Currently runs against:
+- **Progressive** — via the standalone `progressive_scraper.py` script
+- **Travelers** — via the newer `scrape.py --site travelers` CLI
+
+Both produce the same Instantly-ready output shape, but they use different
+implementations (history: Progressive shipped first as a single file; Travelers
+prompted a refactor into a pluggable `scraper/` package that future carriers
+plug into).
 
 ---
 
 ## What you get
 
-Two CSV files in the project folder when both stages have run:
+After a full run, the file you upload to Instantly is:
 
-| File | What's in it |
+| Carrier | Final CSV |
 |---|---|
-| `stage1_progressive_agents.csv` | The raw scrape from Progressive's directory: one row per agency, columns include `agency_name`, `address_line`, `city`, `state`, `zip`, `phone`, `website_url`, `email`, `source_url`. This is the data we trust most — pulled from Progressive's own structured schema.org markup. |
-| `stage2_progressive_agents_enriched.csv` | The Instantly-ready file. Same data, **remapped to Instantly's required column order**, and rows missing a valid email are dropped. Upload this one. |
+| Progressive | `stage2_progressive_agents_enriched.csv` |
+| Travelers | `stage2_travelers_enriched.csv` |
 
-Stage 2's exact columns (in this order, with these lowercase headers):
+**Progressive's Stage 2 columns** (Instantly's required order):
 
 ```
 email,first_name,last_name,company_name,phone,address,city,state,zip,website,source_url
 ```
 
-`first_name` and `last_name` are blank — agencies aren't individuals.
+**Travelers' Stage 2 columns** (adds two diagnostic fields):
+
+```
+email,first_name,last_name,name_source,company_name,phone,address,city,state,zip,website,source_url,enrichment_status
+```
+
+The two extra fields:
+- `name_source` — where the name came from: `team_page` | `contact_page` | `email_local_part` | `no_name_found`
+- `enrichment_status` — overall outcome for the row: `found` | `no_name_found` | `no_email_found` | `fetch_failed`
+
+You can ignore `name_source` and `enrichment_status` on upload — Instantly will just import them as extra columns. They're useful for filtering rows by quality before sending.
 
 ---
 
 ## Prerequisites
 
-- **Windows 10/11** with PowerShell (the commands below assume PowerShell).
-- **Python 3.11 or newer**. Check with `python --version`. If you don't have it,
-  install from [python.org/downloads](https://www.python.org/downloads/) and tick
-  the "Add Python to PATH" box during install.
+- **Windows 10/11** with PowerShell (commands below assume PowerShell; Git Bash works too with minor path tweaks).
+- **Python 3.11 or newer**. Verify with `python --version`. If missing, install from [python.org/downloads](https://www.python.org/downloads/) and tick "Add Python to PATH".
 
 ---
 
 ## First-time setup
 
-Open PowerShell, navigate to the project folder, then run these once:
+Once per machine:
 
 ```powershell
 cd C:\Users\victo\Documents\Scraper
-```
-
-Create a virtual environment (an isolated Python sandbox for this project):
-
-```powershell
 python -m venv venv
-```
-
-Activate it:
-
-```powershell
 .\venv\Scripts\Activate.ps1
-```
-
-> You'll know it worked when your prompt starts with `(venv)`. If you see an
-> error about scripts being disabled, run this once and answer `Y`:
-> ```powershell
-> Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned
-> ```
-> Then re-run the activate line.
-
-Install the three dependencies:
-
-```powershell
 pip install -r requirements.txt
 ```
 
-Quick sanity check:
+> If `Activate.ps1` errors with "running scripts is disabled," run this once and answer `Y`:
+> ```powershell
+> Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned
+> ```
+
+You'll know the venv is active when your prompt starts with `(venv)`.
+
+Sanity check:
 
 ```powershell
 python -c "import requests, bs4, tqdm; print('all good')"
 ```
 
-You should see `all good`. If not, paste the error to whoever's helping you.
+For running tests (optional, dev-time only):
+
+```powershell
+pip install pytest responses
+```
 
 ---
 
-## Running it
+## Daily use
 
-**Every time you open a new PowerShell session**, activate the venv first:
+**Every new PowerShell session, activate the venv first:**
 
 ```powershell
 cd C:\Users\victo\Documents\Scraper
 .\venv\Scripts\Activate.ps1
 ```
 
-### Stage 1 — scrape the directory
+### Quick reference
 
-Full state run (this is the slow one):
+| Goal | Command |
+|---|---|
+| Scrape Progressive (Georgia) | `python progressive_scraper.py --stage 1 --state georgia` then `--stage 2` |
+| Scrape Travelers (Georgia) | `python scrape.py --site travelers --stage 1 --state ga` then `--stage 2` |
+| Test before committing to a long run | Add `--limit 20` to the Stage 1 command |
+| Resume after Ctrl+C | Re-run the same command — it skips rows already in the CSV |
+
+---
+
+## Progressive workflow
+
+Progressive embeds full agency data (name, address, phone, **email**) in
+schema.org JSON-LD on every detail page. We saw 100% email coverage on Georgia,
+so Stage 2 is just a column remap — no website scraping needed.
+
+**Stage 1** — crawl the directory:
 
 ```powershell
 python progressive_scraper.py --stage 1 --state georgia
 ```
 
-For Georgia this takes about **40–45 minutes** because of the polite 1–2 second
-delays between web requests. You can leave it running and walk away — it prints
-per-city and per-agency progress as it goes, and writes rows to disk one at a time.
+Takes ~40–45 minutes for Georgia (~852 agencies, polite 1–2s delay per request).
+Other states use the lowercase slug from Progressive's URL (`new-york`, `texas`,
+`north-carolina`, etc.).
 
-Other states work the same way — just use the lowercase slug from the URL on
-Progressive's site (`new-york`, `texas`, `north-carolina`, etc.).
-
-#### Useful options
-
-- `--limit 20` — stop after 20 new agencies. Use this to test before committing
-  to a long run.
-- `--start-from <URL>` — skip agency URLs alphabetically before this one. Useful
-  if a run got partway through and you want to manually resume from a
-  specific point. (Usually you don't need this — see "Resuming" below.)
-
-#### Examples
-
-```powershell
-# Quick 20-agency test
-python progressive_scraper.py --stage 1 --state georgia --limit 20
-
-# Scrape Texas
-python progressive_scraper.py --stage 1 --state texas
-
-# Resume from a specific point if needed
-python progressive_scraper.py --stage 1 --state georgia --start-from https://www.progressiveagent.com/local-agent/georgia/macon/
-```
-
-### Stage 2 — produce the Instantly-ready file
-
-Once Stage 1 has finished (or even partially run):
+**Stage 2** — produce the Instantly file:
 
 ```powershell
 python progressive_scraper.py --stage 2
 ```
 
-Runs in under a second. Reads `stage1_progressive_agents.csv`, drops rows with no
-email, remaps columns, and writes `stage2_progressive_agents_enriched.csv`.
+Runs in under a second. Reads `stage1_progressive_agents.csv`, drops rows with
+no email, reorders columns, writes `stage2_progressive_agents_enriched.csv`.
 
-This is the file you upload to Instantly.
+**Useful flags:**
+
+- `--limit 20` — stop after 20 new agencies (testing)
+- `--start-from <URL>` — skip URLs alphabetically before this one
+
+---
+
+## Travelers workflow
+
+Travelers' directory gives us name/address/phone reliably (and email for ~40% of
+agencies via a Yext verifiable-credential block). For the remaining ~60%, we
+visit each agency's own website to find emails — that's what Stage 2 does here.
+
+**Stage 1** — crawl the Travelers directory:
+
+```powershell
+python scrape.py --site travelers --stage 1 --state ga
+```
+
+Travelers uses **2-letter state codes** (`ga`, `tx`, `ca`), not the spelled-out
+names Progressive uses. ~10–15 min for Georgia (~870 agencies).
+
+**Stage 2** — scrape agency websites for (name, email) pairs:
+
+```powershell
+python scrape.py --site travelers --stage 2
+```
+
+This is the **slow one — plan for 3–5 hours on a full state.** Each agency
+triggers up to 11 page fetches (homepage + `/contact`, `/team`, `/staff`, etc.).
+SSL errors fail fast (no retries); other transient failures retry with backoff.
+Safe to interrupt — fully resumable.
+
+**Useful flags** (same shape as Progressive, plus `--site`):
+
+- `--site travelers` — required, picks the adapter
+- `--limit 50` — stop after N new agencies (testing)
+- `--start-from <URL>` — skip URLs alphabetically before this one
+
+**Realistic hit rates (50-agency Georgia sample):**
+
+| Status | Rough share |
+|---|---|
+| `found` (email + name) | ~32% |
+| `no_name_found` (email only) | ~38% |
+| `no_email_found` | ~22% |
+| `fetch_failed` (site blocked us) | ~5% |
+
+So roughly **56% of agencies produce at least one usable email**. The
+`no_name_found` rows are still leads — they have a real email, just no person
+name. Instantly templates can use `{{first_name|"there"}}` fallback syntax.
 
 ---
 
 ## Resuming after a crash or Ctrl+C
 
-Stage 1 is **fully resumable**. Every agency row is written to disk *before* the
-next HTTP request starts, and on startup the script reads the existing CSV and
-skips any URLs already in it. So:
+Both scrapers are **fully resumable**:
 
-- Hit Ctrl+C anytime — you won't lose work.
-- To resume, just run the exact same command again. It'll skip the rows already
-  saved and pick up from where it stopped.
+- Every row writes to disk *before* the next HTTP request starts.
+- On startup, the script reads the existing CSV and skips URLs already in it.
+- Hit Ctrl+C any time. Re-run the same command. It picks up where it stopped.
 
-There's no need to delete the CSV between runs unless you want to start over.
-
----
-
-## Output: producing a sample for review
-
-Want a small file to eyeball before uploading 800+ rows to Instantly? After
-Stage 1 has produced its CSV, you can take the first 21 lines (header + 20
-agencies) like this:
-
-```powershell
-Get-Content stage1_progressive_agents.csv -TotalCount 21 | Set-Content sample_output.csv
-python progressive_scraper.py --stage 2
-```
-
-The `--stage 2` part rebuilds the full Instantly file. The `sample_output.csv`
-is just for spot-checking.
+No need to delete CSVs between runs unless you want a clean slate (e.g. to test
+parser changes).
 
 ---
 
 ## Tuning the rate limit
 
-The script makes one web request every 1–2 seconds (random jitter) to be polite
-to Progressive's servers. If you start seeing `[retry]` or HTTP 429 lines in the
-output, the server is asking us to slow down — open `progressive_scraper.py` and
-bump the constant near the top:
+Both scrapers send one HTTP request per host every 1–2 seconds (random
+jittered). If you start seeing `[retry]` or HTTP 429 lines, the server is asking
+us to slow down — open the relevant file and bump the constant:
 
-```python
-RATE_LIMIT_RANGE = (1.0, 2.0)   # change to (3.0, 5.0) if needed
+- Progressive: `progressive_scraper.py` → `RATE_LIMIT_RANGE = (1.0, 2.0)` near the top
+- Travelers: `scraper/core/http.py` → `DEFAULT_RATE_LIMIT = (1.0, 2.0)`
+
+Change to `(3.0, 5.0)` if needed, save, re-run.
+
+**Never set the User-Agent to a fake browser string.** Both scrapers ship an
+honest identifier (`NextCallClub-AgentScraper/1.0 (contact: victorsalazar@nextcallclub.com)`).
+That's the design — Travelers' robots.txt allows us as `User-agent: *`, and a
+fake browser would violate their terms.
+
+---
+
+## Project structure
+
+```
+Scraper/
+├── progressive_scraper.py          # Standalone Progressive script (kept as-is)
+├── scrape.py                       # CLI for the pluggable scraper (Travelers + future)
+├── scraper/                        # Pluggable scraper package
+│   ├── records.py                  # AgencyRecord, EnrichedLead dataclasses
+│   ├── enrichment.py               # Website scraping: emails, names, dedup
+│   ├── core/
+│   │   ├── http.py                 # Polite HTTP fetch + per-domain rate limiter
+│   │   ├── csv_io.py               # Append-row + resumability lookup
+│   │   └── crawl.py                # Generic state→city→agency loop
+│   └── sites/
+│       └── travelers.py            # Travelers adapter (state_url, parse_*)
+├── tests/                          # 120 unit tests (pytest)
+│   ├── test_records.py
+│   ├── test_core_http.py
+│   ├── test_core_csv_io.py
+│   ├── test_core_crawl.py
+│   ├── test_sites_travelers.py
+│   └── test_enrichment.py
+├── conftest.py                     # pytest config (adds project root to sys.path)
+├── requirements.txt                # Locked runtime deps
+├── stage1_*.csv                    # Per-carrier raw scrape output
+├── stage2_*.csv                    # Per-carrier Instantly-ready output
+├── venv/                           # Python sandbox (created by `python -m venv venv`)
+└── README.md                       # This file
 ```
 
-Save, then re-run. Resume will pick up from where you left off.
-
-**Never set the User-Agent to a fake browser.** Honest identification is the
-custom string `NextCallClub-AgentScraper/1.0 (contact: victorsalazar@nextcallclub.com)`
-and it should stay that way. Fake browser strings violate Progressive's terms
-of service and would invite a block.
-
 ---
 
-## Known data quirks (these are Progressive's, not ours)
+## Adding a new state
 
-When you look at the Stage 1 CSV you'll see a few things worth knowing:
-
-1. **Duplicate agency listings.** Progressive lists some agencies twice with
-   slightly different URL slugs but identical data (same phone, same email).
-   Examples we've seen: "The Family Insurance Agency" in Albany, "Hilb Group of
-   NC LLC" in Alpharetta. Instantly will treat duplicate emails as the same
-   lead, so this rarely matters in practice.
-2. **Trailing " Insurance" in some names.** Some agency `name` values in
-   Progressive's structured data end with the word "Insurance" appended
-   (e.g. "Rogers-Wood & Assoc., Inc Insurance"). We don't auto-strip it because
-   plenty of agencies legitimately end in that word ("Trust Insurance", "IGA
-   Insurance"). If it bothers your email templates, you can clean specific
-   strings in Excel before upload.
-3. **Placeholder rows.** Rare records where Progressive has literal `_`
-   placeholders in the name and phone fields. The Stage 2 column-remap drops
-   any row without a valid email, which catches most placeholder cases.
-4. **`http://` vs `https://` in website URLs.** Progressive's structured data
-   stores most website URLs as `http://`. Every modern site auto-redirects to
-   https, so this doesn't affect functionality. We don't auto-upgrade because
-   the rare site that's still http-only would break.
-
----
-
-## Extending to a new state
-
-It's just a slug change in the command line — no code edits required:
+No code change — just a slug change on the command line.
 
 ```powershell
+# Progressive (full state name, lowercase, hyphenated)
 python progressive_scraper.py --stage 1 --state north-carolina
-python progressive_scraper.py --stage 2
+
+# Travelers (2-letter postal code)
+python scrape.py --site travelers --stage 1 --state nc
 ```
 
-The state slug is whatever appears between `/local-agent/` and the next `/` in
-Progressive's URL for that state. Lowercase, hyphenated.
+The slugs are whatever the carrier's URL uses for that state.
 
-**Heads-up:** the script appends to the *same* `stage1_progressive_agents.csv`
-file every time. If you want one CSV per state, rename the existing file before
-running a new state:
+**Heads-up:** each scraper appends to the same per-carrier CSV every time.
+To keep one CSV per state, rename the existing file before running a new state:
 
 ```powershell
-Rename-Item stage1_progressive_agents.csv stage1_progressive_agents_georgia.csv
-python progressive_scraper.py --stage 1 --state texas
-# Now stage1_progressive_agents.csv will only have Texas rows.
+Rename-Item stage1_travelers_agents.csv stage1_travelers_agents_ga.csv
+python scrape.py --site travelers --stage 1 --state tx
+# Now stage1_travelers_agents.csv only contains Texas rows.
 ```
-
-You'd also need to rename the Stage 2 output similarly if you re-run Stage 2.
 
 ---
 
-## Extending to a new carrier (Travelers, etc.)
+## Adding a new carrier (Allstate, State Farm, etc.)
 
-The script is Progressive-specific in two places:
+The pluggable architecture in `scraper/` makes this straightforward — write one
+adapter file, register it, done.
 
-1. **URL traversal** — `parse_state_page()` and `parse_city_page()` know
-   Progressive's URL shape (`/local-agent/<state>/<city>/<agency>/`).
-2. **Field extraction** — `parse_agency_page()` reads Progressive's schema.org
-   JSON-LD block. Other carriers may or may not embed this block, and may name
-   their JSON-LD fields differently.
+**Steps:**
 
-For Travelers, the path is: scout one of their state directory pages, see how
-their URLs are shaped, check whether they embed similar JSON-LD, and either
-rewrite the three parsers for Travelers' structure or build a separate
-`travelers_scraper.py` that shares the polite `fetch_url`, `load_seen_urls`,
-and `append_row` helpers.
+1. **Scout the carrier's site.** What's the URL shape for state/city/agency
+   pages? Do they embed JSON-LD or do you need to scrape HTML directly? Do they
+   have anti-bot measures (Cloudflare, etc.)?
+
+2. **Write `scraper/sites/<carrier>.py`** with four functions matching the
+   adapter contract:
+   ```python
+   def state_url(state_slug: str) -> str: ...
+   def parse_state_page(html: str, state_slug: str) -> list[str]: ...     # city URLs
+   def parse_city_page(html: str, city_url: str) -> list[str]: ...        # agency URLs
+   def parse_agency_page(html: str, source_url: str) -> AgencyRecord: ...
+   ```
+   Use Travelers as a reference — it covers the common patterns (relative URL
+   resolution, JSON-LD extraction, fallback handling).
+
+3. **Register in `scrape.py`:** import your module and add it to the `SITES`
+   dict near the top of the file.
+
+4. **Write tests in `tests/test_sites_<carrier>.py`** using inline HTML
+   snippets. Travelers' test file shows the pattern.
+
+5. **Smoke test:** `python scrape.py --site <carrier> --stage 1 --state <slug> --limit 5`
+
+If the carrier has aggressive anti-bot protection (Cloudflare challenges,
+JavaScript-only rendering with required browser fingerprints, etc.), don't try
+to bypass it — fall back to Apify or another commercial scraping service.
+
+---
+
+## Tests
+
+The pluggable scraper has **120 unit tests** under `tests/`. Run them all:
+
+```powershell
+pytest tests/ -v
+```
+
+Run a specific module:
+
+```powershell
+pytest tests/test_enrichment.py -v
+```
+
+Tests don't touch the network — they use the `responses` library to mock HTTP
+and inline HTML strings for parser inputs. Every test should run in under a
+second.
+
+`progressive_scraper.py` doesn't have its own test file — it was built before
+the test-first refactor and is verified by its production output (852 Georgia
+agencies, manually spot-checked).
+
+---
+
+## Known data quirks
+
+### Progressive
+
+1. **Duplicate listings.** Progressive lists some agencies twice with different
+   slugs but identical data. Instantly dedupes by email at upload, so this
+   rarely matters.
+2. **Trailing " Insurance" in some names** ("Rogers-Wood & Assoc., Inc
+   Insurance"). Not auto-stripped because plenty of agencies legitimately end
+   in that word.
+3. **Placeholder rows** with literal `_` in name/phone — Stage 2's "drop rows
+   without valid email" filter catches them.
+4. **`http://` website URLs** that modern sites redirect to `https://` — no
+   functional issue.
+
+### Travelers
+
+1. **Same agency at multiple addresses.** "Marsh & McLennan Agency LLC"
+   appeared 3× in one Georgia 50-agency sample. Each row has the same email,
+   so Instantly will dedupe.
+2. **Name extraction false positives.** Agency websites with CTA text like
+   "Email Dale Hodges" historically parsed as `first_name="Email"`. The
+   `LEADING_LABELS` strip in `scraper/enrichment.py` handles `Email`/`Call`/`Contact`/`Meet`/`Ask`/`Message`
+   prefixes — add more if you spot new patterns.
+3. **403/blocked sites.** A small percentage of agency websites refuse
+   automated traffic. The row gets `enrichment_status="fetch_failed"` so you
+   can filter it out cleanly.
+4. **JavaScript-only rendering.** Travelers' directory pages are SPAs — we
+   parse the embedded JSON-LD blocks instead of the rendered DOM, which works
+   because Travelers ships both a schema.org `InsuranceAgency` block AND a Yext
+   verifiable credential. If they ever stop emitting those, the scraper breaks.
 
 ---
 
 ## Troubleshooting
 
-### "lxml fails to install" or "Failed to build installable wheels"
+### "lxml fails to install" / "Failed to build installable wheels"
 
-Python 3.14 doesn't have prebuilt wheels for older `lxml` versions on Windows.
-The current `requirements.txt` doesn't list `lxml` at all — we use Python's
-built-in `html.parser` instead, which is plenty fast for this workload. If you
-see `lxml` in any error, make sure `requirements.txt` matches the version in
-this repo (no `lxml` line).
+`requirements.txt` doesn't list `lxml` — we use Python's built-in `html.parser`.
+If you see an `lxml` error, check that your `requirements.txt` matches this
+repo (no `lxml` line).
 
 ### "scripts cannot be loaded because running scripts is disabled"
 
-You're hitting Windows' execution policy. One-time fix:
+Windows execution policy. One-time fix:
 
 ```powershell
 Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned
 ```
 
-Answer `Y`. Then activate the venv again.
+### Lots of `[retry]` or `[fail]` lines
 
-### Stage 1 prints lots of `[retry]` lines
+Single-digit count: ignore — network blips, retries recovered. Flood: slow down
+(see "Tuning the rate limit"). One specific domain producing many failures: that
+site is blocking us — keep going, we just won't get their leads.
 
-Could be your internet, could be Progressive's site being slow that day, or
-could be that we're being lightly rate-limited. A handful is fine (the retries
-will succeed). A flood means slow down — bump `RATE_LIMIT_RANGE` (see "Tuning
-the rate limit" above).
+### `ModuleNotFoundError: No module named 'scraper'` when running pytest
 
-### Stage 1 prints `[skip] no JSON-LD found`
+Missing `conftest.py` at the project root. Create an empty file:
 
-Means an agency page rendered but didn't embed the structured-data block. Rare.
-The script just skips that one and moves on. If you see it on many pages
-in a row, Progressive may have changed their template — flag it and we'll
-investigate.
+```powershell
+New-Item conftest.py -ItemType File
+```
 
-### The CSV looks empty or has only a header
+### Stage 2 CSV is missing rows for some agencies
 
-Either Stage 1 didn't get to write any rows (likely a network failure on the
-state-page fetch), or the state slug is wrong. Check the spelling against the
-URL on Progressive's site.
+Check `enrichment_status` — `fetch_failed` rows exist but might have empty
+emails. Use Excel/Pandas to filter `enrichment_status in ('found', 'no_name_found')`
+before uploading to Instantly.
 
 ---
 
 ## Files in this project
 
-| File | Purpose |
+| File / Folder | Purpose |
 |---|---|
-| `progressive_scraper.py` | The whole scraper. Two stages, one file. |
-| `requirements.txt` | Locked Python dependencies. |
-| `stage1_progressive_agents.csv` | Raw scrape output. Grows as Stage 1 runs. |
-| `stage2_progressive_agents_enriched.csv` | Instantly-ready output. Rebuilt every time Stage 2 runs. |
-| `venv/` | Isolated Python sandbox (created by `python -m venv venv`). |
-| `README.md` | This file. |
+| `progressive_scraper.py` | Standalone Progressive scraper. Self-contained. |
+| `scrape.py` | CLI for the pluggable scraper. Routes to a site adapter via `--site`. |
+| `scraper/` | Reusable scraper package: core HTTP/CSV/crawl + per-site adapters + enrichment. |
+| `tests/` | 120 pytest tests. Mock HTTP, no network. |
+| `conftest.py` | pytest config — empty file that marks the project root. |
+| `requirements.txt` | Pinned runtime deps. |
+| `stage1_<carrier>_agents.csv` | Raw scrape output per carrier. Grows during Stage 1. |
+| `stage2_<carrier>_enriched.csv` | Instantly-ready output per carrier. |
+| `venv/` | Python sandbox. Gitignored. |
 
 ---
 
 ## Honest scope notes
 
-- This was built and verified on **Georgia only** (852 agencies, 100% email
-  coverage from Progressive's JSON-LD). Other states may have different
-  coverage. If a state comes back with significantly less than 100% email
-  coverage, consider building the website-scraping fallback that was
-  originally planned for Stage 2 (see the function structure comments at the
-  bottom of `progressive_scraper.py`).
-- We're **not bypassing any anti-bot, CAPTCHA, or login walls**. Progressive's
-  directory is fully public. If they change the site to require login or add
-  CAPTCHAs, the script will start failing — flag it, don't try to work around
-  it.
-- The User-Agent is honest and contains a real contact email. If Progressive
-  ever reaches out asking us to slow down or stop, we'll hear about it. That's
-  the intended design.
+- **Tested at scale on:** Progressive Georgia (852 agencies, 100% email
+  coverage from JSON-LD), Travelers Georgia (50-agency sample, ~56% usable
+  email coverage after Stage 2). Other states/carriers will vary.
+- **Not bypassing anything.** Both scrapers respect robots.txt (verified for
+  both carriers), use polite rate limits, and send an honest User-Agent. If a
+  carrier ever adds login walls or CAPTCHAs, the scraper will start failing —
+  flag it, don't try to work around it.
+- **The User-Agent contains a real contact email.** If a carrier reaches out
+  asking us to slow down or stop, we'll hear about it. That's the intended
+  design.
+- **Stage 2 for Travelers takes hours.** Plan accordingly — leave it running
+  overnight or kick it off and walk away. The CSV is durable; even if your
+  machine sleeps mid-run you don't lose work.
