@@ -10,7 +10,9 @@ import responses
 from scraper.core.http import (
     MAX_RETRIES,
     USER_AGENT,
+    WIDE_BLOCK_THRESHOLD,
     PerDomainLimiter,
+    WideBlockError,
     fetch_url,
 )
 
@@ -154,3 +156,67 @@ def test_fetch_url_sends_custom_user_agent(no_sleep, session, limiter):
     fetch_url("https://example.com/", session, limiter)
     assert len(responses.calls) == 1
     assert responses.calls[0].request.headers["User-Agent"] == USER_AGENT
+
+
+# --- WideBlockError 403 guard ----------------------------------------------
+
+@responses.activate
+def test_fetch_url_increments_403_counter_on_403(no_sleep, session, limiter):
+    responses.add(responses.GET, "https://example.com/", status=403)
+    fetch_url("https://example.com/", session, limiter)
+    assert limiter._consecutive_403s["example.com"] == 1
+
+
+@responses.activate
+def test_fetch_url_does_not_increment_403_counter_on_404(no_sleep, session, limiter):
+    responses.add(responses.GET, "https://example.com/", status=404)
+    fetch_url("https://example.com/", session, limiter)
+    # 404 is "not found", not "blocked" — counter must not tick.
+    assert limiter._consecutive_403s.get("example.com", 0) == 0
+
+
+@responses.activate
+def test_fetch_url_resets_403_counter_on_200(no_sleep, session, limiter):
+    responses.add(responses.GET, "https://example.com/", status=403)
+    responses.add(responses.GET, "https://example.com/", body="ok", status=200)
+    fetch_url("https://example.com/", session, limiter)  # counter -> 1
+    fetch_url("https://example.com/", session, limiter)  # 200 resets to 0
+    assert limiter._consecutive_403s["example.com"] == 0
+
+
+@responses.activate
+def test_fetch_url_resets_403_counter_on_404(no_sleep, session, limiter):
+    responses.add(responses.GET, "https://example.com/", status=403)
+    responses.add(responses.GET, "https://example.com/", status=404)
+    fetch_url("https://example.com/", session, limiter)  # counter -> 1
+    fetch_url("https://example.com/", session, limiter)  # 404 resets to 0
+    assert limiter._consecutive_403s["example.com"] == 0
+
+
+@responses.activate
+def test_fetch_url_raises_wideblockerror_at_threshold(no_sleep, session, limiter):
+    for _ in range(WIDE_BLOCK_THRESHOLD):
+        responses.add(responses.GET, "https://example.com/", status=403)
+    # First (THRESHOLD - 1) fetches return None and increment the counter.
+    for _ in range(WIDE_BLOCK_THRESHOLD - 1):
+        assert fetch_url("https://example.com/", session, limiter) is None
+    # The fetch that pushes the counter to THRESHOLD raises.
+    with pytest.raises(WideBlockError) as exc_info:
+        fetch_url("https://example.com/", session, limiter)
+    assert exc_info.value.host == "example.com"
+    assert exc_info.value.count == WIDE_BLOCK_THRESHOLD
+
+
+@responses.activate
+def test_wideblockerror_is_per_host(no_sleep, session, limiter):
+    # Trip the wide-block on host A.
+    for _ in range(WIDE_BLOCK_THRESHOLD):
+        responses.add(responses.GET, "https://blocked.com/", status=403)
+    for _ in range(WIDE_BLOCK_THRESHOLD - 1):
+        fetch_url("https://blocked.com/", session, limiter)
+    with pytest.raises(WideBlockError):
+        fetch_url("https://blocked.com/", session, limiter)
+    # Host B is unaffected — its counter never incremented, requests still succeed.
+    responses.add(responses.GET, "https://ok.com/", body="hi", status=200)
+    assert fetch_url("https://ok.com/", session, limiter) == "hi"
+    assert limiter._consecutive_403s.get("ok.com", 0) == 0
