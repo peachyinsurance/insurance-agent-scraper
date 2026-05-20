@@ -1,19 +1,20 @@
 # Insurance Agent Scraper
 
 Pulls insurance agencies from carrier directories (Progressive, Travelers,
-State Farm — more to come) into a CSV ready to upload to Instantly for
-cold-email outreach.
+State Farm, AAA — more to come) into a CSV ready to upload to Instantly for
+cold-email outreach (or to feed Clay for enrichment).
 
 Built for Next Call Club. Currently runs against:
 - **Progressive** — via the standalone `scraper/sites/progressive_scraper.py` script
-- **Travelers** — via the newer `scrape.py --site travelers` CLI
+- **Travelers** — via `scrape.py --site travelers` (crawl-driven adapter)
 - **State Farm** — via `scrape.py --site state_farm` (sitemap-driven, two-pass)
+- **AAA** — via `scrape.py --site aaa` (Apify-driven; Google Maps search wrapped through Apify's actor)
 
-All three produce Instantly-ready output, but they use different implementations
-(history: Progressive shipped first as a single file; Travelers prompted a
-refactor into a pluggable `scraper/` package; State Farm slotted into that same
-package as a sitemap-driven adapter — no state→city→agency walk needed because
-State Farm publishes a sitemap that enumerates every agent URL).
+All four produce Clay/Instantly-ready output, but they use three different
+adapter shapes:
+1. **Crawl-driven** (Travelers) — walk state→city→agency pages, parse JSON-LD per agent.
+2. **Sitemap-driven** (State Farm) — enumerate from a published sitemap, fetch each detail page.
+3. **Apify-driven** (AAA) — outsource the scrape to Apify's Google Maps actor because the carrier site itself isn't directly scrapable.
 
 Email policy varies by carrier:
 - **Progressive** embeds emails in JSON-LD; we extract them in Stage 2.
@@ -21,6 +22,10 @@ Email policy varies by carrier:
   agency websites.
 - **State Farm** doesn't expose emails at all — we ship the agent list and
   hand it to **Clay** for email enrichment downstream.
+- **AAA** — same as State Farm: Clay handles enrichment. AAA's site is a
+  federation portal with no scrapable agent directory (`Disallow: /aaa/*` in
+  robots.txt), so we use Apify's Google Maps actor against `"AAA agents in <STATE>"`
+  queries instead.
 
 ---
 
@@ -33,6 +38,7 @@ After a full run, the file you upload to Instantly (or hand to Clay) is:
 | Progressive | `stage2_progressive_agents_enriched.csv` | Direct — extracted from JSON-LD |
 | Travelers | `stage2_travelers_enriched.csv` | Direct — partially extracted; gaps via website scrape |
 | State Farm | `stage2_state_farm_enriched.csv` | **Empty by design — Clay enriches** |
+| AAA | `stage1_aaa_agents.csv` (no Stage 2) | **Empty by design — Clay enriches** |
 
 **Progressive's Stage 2 columns** (Instantly's required order):
 
@@ -69,6 +75,18 @@ source_url,state,city,first_name_guess,last_name_guess,agent_id
 
 The `*_guess` columns are mined from URL slugs (lossy on `Mc`/`O'` casing and
 middle initials); Stage 2 overwrites them with cleaner names from JSON-LD.
+
+**AAA's Stage 1 CSV is the deliverable** — there's no Stage 2 because Clay
+handles everything (emails, person names, etc.) downstream. Column shape is
+optimized for Clay's expected import fields plus dedup/quality-filter provenance:
+
+```
+company_name,website,phone,street_address,city,state,postal_code,google_place_id,google_maps_url,category,rating,review_count,source_query
+```
+
+The first 7 columns are what Clay reads; the last 6 are provenance from Apify's
+Google Maps actor (placeId for dedup, category to filter out non-insurance hits
+if needed, rating/review_count as quality signal, source_query for traceability).
 
 ---
 
@@ -128,6 +146,8 @@ cd C:\Users\victo\Documents\Scraper
 | Scrape Travelers (Georgia) | `python scrape.py --site travelers --stage 1 --state ga` then `--stage 2` |
 | Scrape State Farm (Georgia) | `python scrape.py --site state_farm --stage 1 --state ga` then `--stage 2` |
 | Scrape State Farm (all 50 states) | `python scrape.py --site state_farm --stage 1` (omit `--state`) then `--stage 2` |
+| Scrape AAA (Texas) | `$env:APIFY_TOKEN = "<token>"` then `python scrape.py --site aaa --stage 1 --state tx` |
+| Recover an interrupted AAA run | `python scrape.py --site aaa --stage 1 --state tx --from-run <run-id>` |
 | Test before committing to a long run | Add `--limit 20` to the Stage 1 command |
 | Resume after Ctrl+C | Re-run the same command — it skips rows already in the CSV |
 
@@ -287,6 +307,93 @@ re-run after waiting or changing IP to resume from where it stopped.
 
 ---
 
+## AAA workflow
+
+AAA is **not** scraped directly. The 2026-05-14 scout showed `aaa.com` is a
+federation portal with no agent/branch sitemap (robots.txt `Disallow: /aaa/*`,
+sitemap index has only travel/membership/marketing properties). Actual data
+lives across ~30 regional clubs with heterogeneous sites — multi-week build
+for branch-level (not agent-level) data.
+
+Andrew's decision (2026-05-14): use **Apify's `compass/crawler-google-places`
+actor** with `"AAA agents in <STATE>"` queries. Google Maps surfaces enough
+context for Clay to enrich the rest. No Stage 2 — Stage 1's output is the
+deliverable.
+
+**Required setup:** APIFY_TOKEN env var. Get one at
+[console.apify.com/settings/integrations](https://console.apify.com/settings/integrations)
+(personal API token). Then in your PowerShell session:
+
+```powershell
+$env:APIFY_TOKEN = "apify_api_xxxxxxxxxxxxxxxxxxxxxxxx"
+```
+
+It's session-scoped — set it each new PowerShell window. **Never commit the
+token, never paste it into chat or other tools.**
+
+**Stage 1 (only stage):**
+
+```powershell
+python scrape.py --site aaa --stage 1 --state tx
+python scrape.py --site aaa --stage 1 --state tx --limit 5     # smoke test
+```
+
+`--state` is required (per-state queries; no national mode). The actor takes
+~30–60 min per state regardless of `--limit` (Google Maps pagination dominates).
+Resumable on `google_place_id` — re-running the same state skips placeIds
+already in the CSV.
+
+**How the actor is configured** (in [scraper/sites/aaa.py](scraper/sites/aaa.py)):
+
+- `searchStringsArray`: `["AAA agents in <STATE>"]` (e.g. "AAA agents in TX")
+- `state`: full state name ("Texas", not "TX") — actor requires this format
+- `countryCode`: `"us"` (lowercase — actor rejects `"US"`)
+- `maxCrawledPlacesPerSearch`: 1000 by default, overridable via `--limit`
+- `includeReviews` / `includeImages`: false (would slow runs without adding value)
+
+The structured `state` + `countryCode` are **critical** — without them the
+actor's proxy region biases the results (a TX query came back with California
+results on 2026-05-14 because no geographic bias was set).
+
+**The AAA-name filter** (`is_aaa_result` in aaa.py):
+
+Google's relevance ranker for `"AAA agents in TX"` returns ~75% impostors —
+businesses whose names happen to start with "AAA" but aren't the AAA roadside
+brand (AAAA Auto Insurance, AAA Loans, AAA Bail Bonds, AAA Security Guard,
+AAA Surety Co, etc.). The filter accepts a result only if **both**:
+
+1. Title starts with `"AAA "` (4-char prefix, uppercase, trailing space)
+2. Website host is `aaa.com` or any `*.aaa.com` subdomain
+
+Trade-off: drops legit AAA listings on Google Maps with no website at all
+(~2 per 100 results). Acceptable for ~90%+ precision on what Clay receives.
+
+**Realistic yield**: Texas produced **30 clean rows** out of 118 raw Apify
+results. Google Maps' index for "AAA agents in <STATE>" is shallow — don't
+expect the 1000-result ceiling to be hit even for large states.
+
+**Long-run resilience — the `--from-run` flag:**
+
+The actor can take 45–90 min for a 1000-result run; our local poll has a 2-hour
+ceiling. If the Python loop is interrupted (network blip, manual Ctrl+C,
+machine sleep) but the Apify run continues on Apify's side, recover with:
+
+```powershell
+python scrape.py --site aaa --stage 1 --state tx --from-run wFn0Va9h7Zjh5G8Qz
+```
+
+The flag skips starting a new actor and fetches the items from the existing
+dataset. Apify retains datasets for ~30 days by default, so recovery has a
+generous window.
+
+To find the run ID, check the Apify console under Runs, or the diagnostic curl:
+
+```powershell
+curl.exe -s "https://api.apify.com/v2/actor-runs/<run-id>?token=$env:APIFY_TOKEN" | ConvertFrom-Json | Select-Object -ExpandProperty data | Select-Object status, finishedAt, defaultDatasetId, stats
+```
+
+---
+
 ## Resuming after a crash or Ctrl+C
 
 Both scrapers are **fully resumable**:
@@ -333,10 +440,11 @@ Scraper/
 │   │   ├── jsonld.py               # JSON-LD reader (handles @graph, malformed blocks)
 │   │   └── text.py                 # clean(), format_phone(), looks_like_email()
 │   └── sites/
+│       ├── aaa.py                  # AAA adapter (Apify-driven: query/payload/row helpers)
 │       ├── progressive_scraper.py  # Standalone Progressive script (co-located, not a pluggable adapter)
 │       ├── state_farm.py           # State Farm adapter (sitemap-driven: iter_agency_urls)
 │       └── travelers.py            # Travelers adapter (state_url, parse_*)
-├── tests/                          # 192 unit tests (pytest)
+├── tests/                          # 219 unit tests (pytest)
 │   ├── test_records.py
 │   ├── test_core_http.py
 │   ├── test_core_csv_io.py
@@ -345,6 +453,7 @@ Scraper/
 │   ├── test_core_text.py
 │   ├── test_sites_travelers.py
 │   ├── test_sites_state_farm.py
+│   ├── test_sites_aaa.py
 │   └── test_enrichment.py
 ├── conftest.py                     # pytest config (adds project root to sys.path)
 ├── requirements.txt                # Locked runtime deps
@@ -369,9 +478,14 @@ python scrape.py --site travelers --stage 1 --state nc
 
 # State Farm (2-letter postal code; --state is optional — omit for all 50)
 python scrape.py --site state_farm --stage 1 --state nc
+
+# AAA (2-letter postal code; --state is REQUIRED, no national mode)
+python scrape.py --site aaa --stage 1 --state nc
 ```
 
-The slugs are whatever the carrier's URL uses for that state.
+The slugs are whatever the carrier's URL uses for that state. For AAA, the
+slug → full state name mapping happens internally (the Apify actor wants
+"North Carolina", not "NC").
 
 **Heads-up:** each scraper appends to the same per-carrier CSV every time.
 To keep one CSV per state, rename the existing file before running a new state:
@@ -386,7 +500,7 @@ python scrape.py --site travelers --stage 1 --state tx
 
 ## Adding a new carrier (Allstate, Liberty Mutual, etc.)
 
-The pluggable architecture in `scraper/` supports two adapter shapes — pick
+The pluggable architecture in `scraper/` supports three adapter shapes — pick
 whichever matches the carrier you're scraping.
 
 **Crawl-driven** (Travelers pattern): use this when the carrier publishes
@@ -421,13 +535,35 @@ Stage 2 reads that CSV and enriches. Use [scraper/sites/state_farm.py](scraper/s
 as a reference. Stage 1 + Stage 2 handlers in `scrape.py` are per-carrier
 (`run_state_farm_stage1`, etc.) — copy that pattern for your new carrier.
 
-**Steps for either shape:**
+**Apify-driven** (AAA pattern): use this when the carrier's own site isn't
+directly scrapable (federation portals, robots.txt blocks, anti-bot walls)
+and we'd rather wrap Apify's Google Maps actor than fight the carrier. Adapter
+exposes pure helpers — no `iter_agency_urls`, no `parse_agency_page`:
+
+```python
+APIFY_ACTOR_ID = "compass/crawler-google-places"
+
+def query_for_state(state_slug: str) -> str: ...                          # "AAA agents in TX"
+def state_full_name(state_slug: str) -> str: ...                          # "TX" → "Texas"
+def build_apify_input(state_slug, limit=None) -> dict: ...                # actor payload
+def apify_item_to_row(item, source_query) -> dict[str, str]: ...          # Clay-ready row
+def is_aaa_result(item) -> bool: ...                                      # carrier-specific filter
+```
+
+The Apify API call (start run, poll, fetch dataset, recover via `--from-run`)
+lives in `scrape.py`'s `_run_apify_actor` / `_resume_apify_run` / `run_aaa_stage1`.
+Use [scraper/sites/aaa.py](scraper/sites/aaa.py) as a reference. Requires an
+`APIFY_TOKEN` env var at runtime.
+
+**Steps for any shape:**
 
 1. **Scout the carrier's site.** Robots.txt, render type (server-side HTML vs
    JS-only), JSON-LD presence, anti-bot stack (Cloudflare/Akamai/Imperva), and
    — critically — **does a sitemap exist?** Check `/sitemap.xml` first. If the
    carrier enumerates agents in a sitemap, the sitemap-driven adapter is much
-   less fragile than HTML scraping.
+   less fragile than HTML scraping. If robots.txt blocks the relevant paths
+   or the site is a federation portal without consolidated agent data, fall
+   back to the Apify-driven pattern.
 2. **Write the adapter** in `scraper/sites/<carrier>.py` matching whichever
    contract above fits.
 3. **Register in `scrape.py`'s `SITES` dict.** For sitemap-driven adapters,
@@ -445,7 +581,7 @@ to bypass it — fall back to Apify or another commercial scraping service.
 
 ## Tests
 
-The pluggable scraper has **192 unit tests** under `tests/`. Run them all:
+The pluggable scraper has **219 unit tests** under `tests/`. Run them all:
 
 ```powershell
 pytest tests/ -v
@@ -499,6 +635,32 @@ agencies, manually spot-checked).
    parse the embedded JSON-LD blocks instead of the rendered DOM, which works
    because Travelers ships both a schema.org `InsuranceAgency` block AND a Yext
    verifiable credential. If they ever stop emitting those, the scraper breaks.
+
+### AAA
+
+1. **`aaa.com` is not directly scrapable.** Robots.txt blocks `/aaa/*` (where
+   the locator lives) and the sitemap index only exposes travel/membership/
+   marketing properties — no agent or branch sitemap. We use Apify's
+   Google Maps actor instead per Andrew's 2026-05-14 call.
+2. **~75% impostor rate from Google Maps' raw results.** Queries like "AAA
+   agents in TX" surface unrelated businesses whose names happen to start
+   with "AAA": loans, bail bonds, security guards, real estate, surety
+   bonds, etc. The `is_aaa_result` filter requires both the `"AAA "` title
+   prefix AND an `aaa.com` / `*.aaa.com` website host. ~25% pass the filter.
+3. **Limited per-state yield.** Google Maps' index for "AAA agents in <STATE>"
+   is shallow — Texas yielded 30 clean rows out of 118 raw Apify results.
+   Real AAA Texas has many more branches; Google just doesn't expose them
+   all in this query shape. Don't expect the 1000-result ceiling to be hit.
+4. **The 2-letter `state` field in the CSV is Apify's `state` field**, which
+   returns the full state name ("Texas", not "TX"). Different from State Farm/
+   Travelers which use 2-letter codes. Clay can normalize either way.
+5. **AAA listings without a website are dropped.** Trade-off: we can't tell
+   no-website "AAA texas" from impostor "AAA Loans" without a domain signal.
+   ~2 legit listings per 100 results are lost this way; the alternative is
+   shipping ~25 impostors per 100 results to Clay.
+6. **Apify run timeouts are common.** Default 2-hour ceiling in our poll loop;
+   if Python times out but the Apify run is still alive, recover with
+   `--from-run <run-id>` (no double-billing — Apify keeps datasets ~30 days).
 
 ### State Farm
 
@@ -574,9 +736,10 @@ before uploading to Instantly.
 | `scraper/sites/progressive_scraper.py` | Standalone Progressive scraper. Self-contained. |
 | `scrape.py` | CLI for the pluggable scraper. Routes to a site adapter via `--site`. |
 | `scraper/` | Reusable scraper package: core HTTP/CSV/crawl + per-site adapters + enrichment. |
+| `scraper/sites/aaa.py` | AAA adapter (Apify-driven; pure helpers — query, payload, row mapper, filter). |
 | `scraper/sites/state_farm.py` | State Farm adapter (sitemap-driven, no state→city walk). |
 | `scraper/sites/travelers.py` | Travelers adapter (state→city→agency crawl). |
-| `tests/` | 192 pytest tests. Mock HTTP, no network. |
+| `tests/` | 219 pytest tests. Mock HTTP, no network. |
 | `conftest.py` | pytest config — empty file that marks the project root. |
 | `requirements.txt` | Pinned runtime deps. |
 | `stage1_<carrier>_agents.csv` | Raw scrape output per carrier. Grows during Stage 1. |
@@ -611,3 +774,15 @@ before uploading to Instantly.
   State Farm doesn't expose emails on their pages. If you upload the State
   Farm Stage 2 CSV directly to Instantly, every row's `email` column will be
   blank. Run it through Clay first.
+- **AAA isn't scraped directly.** `aaa.com`'s robots.txt blocks the locator
+  path, the federation portal has no agent sitemap, and the regional clubs
+  are heterogeneous. We use Apify's Google Maps actor instead — costs Apify
+  compute credits (covered by the company subscription on Andrew's account),
+  ships ~25–40 high-precision branches per state, and Clay handles email
+  enrichment downstream. AAA's Stage 1 CSV is the deliverable; there's no
+  Stage 2.
+- **The AAA filter discards real listings without websites.** Google Maps
+  surfaces ~2 legit AAA listings per 100 results that have no website set.
+  We can't disambiguate those from impostors (AAA Loans, AAA Bail Bonds,
+  etc.) without the domain signal, so they get dropped. Acceptable cost
+  to avoid shipping ~25% impostors per run.

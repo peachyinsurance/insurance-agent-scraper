@@ -14,6 +14,11 @@ Usage:
     python scrape.py --site state_farm --stage 1                  # all 50 states (~25K rows)
     python scrape.py --site state_farm --stage 2                  # ~8 hrs national; per-state much shorter
 
+  AAA (Apify-driven, Stage 1 only — Clay enriches downstream):
+    $env:APIFY_TOKEN = "<token>"                                  # required
+    python scrape.py --site aaa --stage 1 --state tx              # one state, ~10-20 min
+    python scrape.py --site aaa --stage 1 --state tx --limit 50   # smoke test, ~2 min
+
 Output files (per site):
   stage1_<site>_agents.csv      — raw rows from the directory (or sitemap)
   stage2_<site>_enriched.csv    — Instantly-ready rows
@@ -37,15 +42,23 @@ from scraper.core.csv_io import append_row, load_seen_keys
 from scraper.core.http import PerDomainLimiter, WideBlockError, fetch_url
 from scraper.enrichment import enrich_agency, extract_name_from_email_local_part
 from scraper.records import AgencyRecord, EnrichedLead
-from scraper.sites import state_farm, travelers
+from scraper.sites import aaa, state_farm, travelers
 
 
 SITES = {
     "travelers": travelers,
     "state_farm": state_farm,
-    # progressive: not ported into the new architecture yet — use the
-    # standalone progressive_scraper.py at the project root for that carrier.
+    "aaa": aaa,
+    # progressive: not ported into the new architecture — use the
+    # standalone progressive_scraper.py in scraper/sites/ for that carrier.
 }
+
+
+APIFY_BASE_URL = "https://api.apify.com/v2"
+APIFY_POLL_INTERVAL_SECONDS = 20
+APIFY_RUN_TIMEOUT_SECONDS = 2 * 60 * 60  # 2 hr ceiling per state run
+                                          # (1000-result Google Maps scrapes can
+                                          # take 45-90 min in practice)
 
 
 STAGE1_COLUMNS = [
@@ -72,6 +85,17 @@ STAGE1_STATE_FARM_COLUMNS = [
 STAGE2_STATE_FARM_COLUMNS = [
     "email", "first_name", "last_name", "company_name",
     "phone", "address", "city", "state", "zip", "website", "source_url",
+]
+
+# AAA Stage 1 only (Clay handles email/name enrichment, so no Stage 2). Column
+# names match Clay's expected import shape; trailing columns (google_*, category,
+# rating, review_count, source_query) are provenance for dedup + downstream
+# quality filtering.
+STAGE1_AAA_COLUMNS = [
+    "company_name", "website", "phone", "street_address",
+    "city", "state", "postal_code",
+    "google_place_id", "google_maps_url", "category",
+    "rating", "review_count", "source_query",
 ]
 
 
@@ -522,6 +546,215 @@ def _state_farm_placeholder_row(stage1_row: dict) -> dict:
     }
 
 
+# --- AAA Stage 1 (Apify-driven, Clay handles enrichment) -------------------
+
+_APIFY_TERMINAL_BAD = ("FAILED", "ABORTED", "TIMED-OUT", "TIMED_OUT")
+
+
+def _apify_get_run(run_id: str, token: str) -> dict:
+    """GET /actor-runs/<id>. Returns the `data` block. Raises on HTTP error."""
+    response = requests.get(
+        f"{APIFY_BASE_URL}/actor-runs/{run_id}",
+        params={"token": token},
+        timeout=60,
+    )
+    if response.status_code >= 400:
+        raise RuntimeError(
+            f"Apify run lookup failed: HTTP {response.status_code} — "
+            f"{response.text[:300]}"
+        )
+    return response.json().get("data", {})
+
+
+def _apify_start_run(actor_id: str, payload: dict, token: str) -> dict:
+    """Start an actor run. Returns the `data` block with id + defaultDatasetId."""
+    actor_path = actor_id.replace("/", "~")
+    response = requests.post(
+        f"{APIFY_BASE_URL}/acts/{actor_path}/runs",
+        params={"token": token},
+        json=payload,
+        timeout=60,
+    )
+    if response.status_code >= 400:
+        raise RuntimeError(
+            f"Apify run start failed: HTTP {response.status_code} — "
+            f"{response.text[:300]}"
+        )
+    return response.json().get("data", {})
+
+
+def _apify_fetch_dataset_items(dataset_id: str, token: str) -> list[dict]:
+    """Fetch all items from a SUCCEEDED run's dataset. Raises on HTTP error."""
+    response = requests.get(
+        f"{APIFY_BASE_URL}/datasets/{dataset_id}/items",
+        params={"token": token, "format": "json"},
+        timeout=120,
+    )
+    if response.status_code >= 400:
+        raise RuntimeError(
+            f"Apify dataset fetch failed: HTTP {response.status_code} — "
+            f"{response.text[:300]}"
+        )
+    return response.json()
+
+
+def _poll_apify_run_until_done(run_id: str, token: str) -> str:
+    """Poll the run every APIFY_POLL_INTERVAL_SECONDS until terminal state.
+
+    Returns the defaultDatasetId on SUCCEEDED. Raises RuntimeError on local
+    timeout (the run may still be alive on Apify's side — caller can recover
+    with --from-run) or on a bad terminal status.
+    """
+    deadline = time.monotonic() + APIFY_RUN_TIMEOUT_SECONDS
+    while True:
+        if time.monotonic() > deadline:
+            raise RuntimeError(
+                f"Apify run {run_id} did not finish within "
+                f"{APIFY_RUN_TIMEOUT_SECONDS}s. The run may still be alive on "
+                f"Apify's side — recover with:\n"
+                f"  python scrape.py --site aaa --stage 1 --state <X> --from-run {run_id}"
+            )
+        time.sleep(APIFY_POLL_INTERVAL_SECONDS)
+
+        run_state = _apify_get_run(run_id, token)
+        status = run_state.get("status", "?")
+        items_so_far = run_state.get("stats", {}).get("itemCount", "?")
+        print(f"  ...status={status}, items={items_so_far}")
+
+        if status == "SUCCEEDED":
+            return run_state.get("defaultDatasetId", "")
+        if status in _APIFY_TERMINAL_BAD:
+            raise RuntimeError(f"Apify run {run_id} ended with status={status}")
+
+
+def _run_apify_actor(actor_id: str, payload: dict, token: str) -> list[dict]:
+    """Start a new Apify run, poll to completion, return dataset items.
+
+    Async pattern (not sync-get-dataset-items) because the sync endpoint has
+    a 5-min hard timeout and one state's Google Maps scrape can take 45-90
+    minutes.
+    """
+    run_data = _apify_start_run(actor_id, payload, token)
+    run_id = run_data.get("id")
+    dataset_id = run_data.get("defaultDatasetId")
+    if not run_id or not dataset_id:
+        raise RuntimeError(f"Apify run response missing id/datasetId: {run_data}")
+
+    print(f"  Apify run started: id={run_id}")
+    dataset_id = _poll_apify_run_until_done(run_id, token)
+    return _apify_fetch_dataset_items(dataset_id, token)
+
+
+def _resume_apify_run(run_id: str, token: str) -> list[dict]:
+    """Recover dataset items from a previously-started Apify run.
+
+    Used when the local Python timed out but the run is still alive (or
+    already SUCCEEDED) on Apify's side — saves us paying for the compute
+    twice. If the run is still RUNNING, polls until done.
+    """
+    print(f"  Resuming Apify run: id={run_id}")
+    run_state = _apify_get_run(run_id, token)
+    dataset_id = run_state.get("defaultDatasetId")
+    if not dataset_id:
+        raise RuntimeError(f"Apify run {run_id} missing defaultDatasetId")
+
+    status = run_state.get("status", "?")
+    items_so_far = run_state.get("stats", {}).get("itemCount", "?")
+    print(f"  Current status: {status}, items={items_so_far}")
+
+    if status in _APIFY_TERMINAL_BAD:
+        raise RuntimeError(
+            f"Apify run {run_id} ended with status={status} — nothing to recover."
+        )
+    if status != "SUCCEEDED":
+        dataset_id = _poll_apify_run_until_done(run_id, token)
+
+    return _apify_fetch_dataset_items(dataset_id, token)
+
+
+def run_aaa_stage1(state: str | None, limit: int | None, from_run: str | None = None) -> None:
+    """Query Apify's Google Maps actor for AAA agents in one state.
+
+    No Stage 2 — Clay handles email + person-name enrichment downstream.
+    Resumable on google_place_id: re-running the same state skips placeIds
+    already in the CSV. Items without a placeId (rare) are skipped because
+    dedup wouldn't work without a stable key.
+
+    `from_run` recovers items from a previously-started Apify run (by run
+    ID) — used when a local timeout interrupted polling but the run is
+    still alive on Apify's side. Skips the start step and goes straight
+    to status check + fetch.
+    """
+    if not state:
+        print("FATAL: --state is required for --site aaa (e.g. --state tx).")
+        sys.exit(1)
+
+    token = os.environ.get("APIFY_TOKEN")
+    if not token:
+        print("FATAL: APIFY_TOKEN env var is not set.")
+        print("  Get a token at: https://console.apify.com/settings/integrations")
+        print('  Then in PowerShell: $env:APIFY_TOKEN = "<your token>"')
+        sys.exit(1)
+
+    csv_path = _stage1_csv_path("aaa")
+    seen_keys = load_seen_keys(csv_path, ("google_place_id",))
+
+    query = aaa.query_for_state(state)
+
+    print(f"Stage 1: site=aaa  state={state.upper()}")
+    print(f"  Output: {csv_path}")
+    print(f"  Already saved: {len(seen_keys)} unique placeIds (will be deduped)")
+    print(f"  Apify actor: {aaa.APIFY_ACTOR_ID}")
+    print(f"  Query: {query!r}")
+    if from_run:
+        print(f"  Mode: RECOVER from existing run id={from_run}")
+    else:
+        payload = aaa.build_apify_input(state, limit)
+        print(f"  Max results per query: {payload['maxCrawledPlacesPerSearch']}")
+    print()
+
+    if from_run:
+        items = _resume_apify_run(from_run, token)
+    else:
+        items = _run_apify_actor(aaa.APIFY_ACTOR_ID, payload, token)
+    print(f"\n  Apify returned {len(items)} items.\n")
+
+    written = 0
+    skipped_seen = 0
+    skipped_no_id = 0
+    skipped_not_aaa = 0
+
+    for item in items:
+        place_id = item.get("placeId") or ""
+        if not place_id:
+            skipped_no_id += 1
+            continue
+        if (place_id,) in seen_keys:
+            skipped_seen += 1
+            continue
+        if not aaa.is_aaa_result(item):
+            skipped_not_aaa += 1
+            print(f"  [skip] not AAA: {item.get('title', '?')!r}")
+            continue
+
+        row = aaa.apify_item_to_row(item, source_query=query)
+        append_row(csv_path, row, STAGE1_AAA_COLUMNS)
+        seen_keys.add((place_id,))
+        written += 1
+        print(f"  [{written}] {row['company_name']} | "
+              f"{row['city']}, {row['state']} | "
+              f"{row['website'] or '(no website)'}")
+
+    print()
+    print(f"Stage 1 done.")
+    print(f"  New rows written:                {written}")
+    print(f"  Skipped (already in CSV):        {skipped_seen}")
+    if skipped_not_aaa:
+        print(f"  Skipped (name not 'AAA '):       {skipped_not_aaa}")
+    if skipped_no_id:
+        print(f"  Skipped (no placeId in result):  {skipped_no_id}")
+
+
 # --- CLI -------------------------------------------------------------------
 
 def main() -> None:
@@ -535,13 +768,17 @@ def main() -> None:
     parser.add_argument("--stage", type=int, required=True, choices=[1, 2],
                         help="1 = crawl directory, 2 = enrich emails from agency websites")
     parser.add_argument("--state", default=None,
-                        help="State slug (Stage 1 only). 2-letter code for Travelers and "
-                             "State Farm (e.g. 'ga'). Optional for state_farm — omit to "
-                             "enumerate all states.")
+                        help="State slug (Stage 1 only). 2-letter code for Travelers, "
+                             "State Farm, and AAA (e.g. 'ga', 'tx'). Required for travelers "
+                             "and aaa; optional for state_farm (omit to enumerate all states).")
     parser.add_argument("--limit", type=int, default=None,
                         help="Stop after N new agencies (useful for testing)")
     parser.add_argument("--start-from", default=None,
                         help="Skip agency URLs alphabetically before this (Travelers Stage 1 only)")
+    parser.add_argument("--from-run", default=None,
+                        help="(AAA Stage 1 only) Recover items from an existing Apify run ID "
+                             "instead of starting a new run — useful when a local timeout "
+                             "interrupted polling but the run is still alive on Apify's side.")
 
     args = parser.parse_args()
 
@@ -551,6 +788,11 @@ def main() -> None:
                 run_state_farm_stage1(args.state, args.limit)
             else:
                 run_state_farm_stage2(args.limit)
+        elif args.site == "aaa":
+            if args.stage == 1:
+                run_aaa_stage1(args.state, args.limit, from_run=args.from_run)
+            else:
+                parser.error("AAA only has Stage 1 — Clay handles email/name enrichment.")
         else:
             if args.stage == 1:
                 if not args.state:
