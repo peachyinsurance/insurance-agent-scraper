@@ -15,7 +15,7 @@ Usage:
     python scrape.py --site state_farm --stage 2                  # ~8 hrs national; per-state much shorter
 
   AAA (Apify-driven, Stage 1 only — Clay enriches downstream):
-    $env:APIFY_TOKEN = "<token>"                                  # required
+    # requires APIFY_TOKEN in .env (copy .env.example)
     python scrape.py --site aaa --stage 1 --state tx              # one state, ~10-20 min
     python scrape.py --site aaa --stage 1 --state tx --limit 50   # smoke test, ~2 min
 
@@ -36,6 +36,7 @@ import time
 from dataclasses import asdict, fields
 
 import requests
+from dotenv import load_dotenv
 
 from scraper.core.crawl import run_crawl
 from scraper.core.csv_io import append_row, load_seen_keys
@@ -691,9 +692,9 @@ def run_aaa_stage1(state: str | None, limit: int | None, from_run: str | None = 
 
     token = os.environ.get("APIFY_TOKEN")
     if not token:
-        print("FATAL: APIFY_TOKEN env var is not set.")
+        print("FATAL: APIFY_TOKEN is not set.")
         print("  Get a token at: https://console.apify.com/settings/integrations")
-        print('  Then in PowerShell: $env:APIFY_TOKEN = "<your token>"')
+        print("  Then put it in .env next to scrape.py (copy .env.example).")
         sys.exit(1)
 
     csv_path = _stage1_csv_path("aaa")
@@ -758,6 +759,10 @@ def run_aaa_stage1(state: str | None, limit: int | None, from_run: str | None = 
 # --- CLI -------------------------------------------------------------------
 
 def main() -> None:
+    # API keys live in .env next to this file (gitignored). Anything already
+    # set in the shell wins over the file.
+    load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
+
     parser = argparse.ArgumentParser(
         description="Scrape insurance agent directories into Instantly-ready CSVs.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
