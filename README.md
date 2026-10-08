@@ -146,7 +146,8 @@ cd C:\Users\victo\Documents\Scraper
 | Scrape Travelers (Georgia) | `python scrape.py --site travelers --stage 1 --state ga` then `--stage 2` |
 | Scrape State Farm (Georgia) | `python scrape.py --site state_farm --stage 1 --state ga` then `--stage 2` |
 | Scrape State Farm (all 50 states) | `python scrape.py --site state_farm --stage 1` (omit `--state`) then `--stage 2` |
-| Scrape AAA (Texas) | `$env:APIFY_TOKEN = "<token>"` then `python scrape.py --site aaa --stage 1 --state tx` |
+| Scrape AAA (Texas) | `APIFY_TOKEN` in `.env`, then `python scrape.py --site aaa --stage 1 --state tx` |
+| Fill empty Carrier/State on a HubSpot export | `python backfill_crm.py <export.csv> --dry-run`, then without `--dry-run` (`APIFY_TOKEN` in `.env`) |
 | Recover an interrupted AAA run | `python scrape.py --site aaa --stage 1 --state tx --from-run <run-id>` |
 | Test before committing to a long run | Add `--limit 20` to the Stage 1 command |
 | Resume after Ctrl+C | Re-run the same command — it skips rows already in the CSV |
@@ -320,16 +321,17 @@ actor** with `"AAA agents in <STATE>"` queries. Google Maps surfaces enough
 context for Clay to enrich the rest. No Stage 2 — Stage 1's output is the
 deliverable.
 
-**Required setup:** APIFY_TOKEN env var. Get one at
+**Required setup:** an Apify token in `.env`. Get one at
 [console.apify.com/settings/integrations](https://console.apify.com/settings/integrations)
-(personal API token). Then in your PowerShell session:
+(personal API token). Then, once:
 
 ```powershell
-$env:APIFY_TOKEN = "apify_api_xxxxxxxxxxxxxxxxxxxxxxxx"
+Copy-Item .env.example .env    # then edit .env: APIFY_TOKEN=apify_api_xxxxxxxx
 ```
 
-It's session-scoped — set it each new PowerShell window. **Never commit the
-token, never paste it into chat or other tools.**
+`scrape.py` and `backfill_crm.py` load `.env` on startup. A value set in the
+shell (`$env:APIFY_TOKEN = "..."`) overrides the file. `.env` is gitignored —
+**never commit the token, never paste it into chat or other tools.**
 
 **Stage 1 (only stage):**
 
@@ -552,8 +554,8 @@ def is_aaa_result(item) -> bool: ...                                      # carr
 
 The Apify API call (start run, poll, fetch dataset, recover via `--from-run`)
 lives in `scrape.py`'s `_run_apify_actor` / `_resume_apify_run` / `run_aaa_stage1`.
-Use [scraper/sites/aaa.py](scraper/sites/aaa.py) as a reference. Requires an
-`APIFY_TOKEN` env var at runtime.
+Use [scraper/sites/aaa.py](scraper/sites/aaa.py) as a reference. Requires
+`APIFY_TOKEN` in `.env` (or the shell) at runtime.
 
 **Steps for any shape:**
 
